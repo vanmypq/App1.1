@@ -55,6 +55,9 @@ class AutoAnswerService : AccessibilityService() {
     private var lastSent = ""
     private val answerCache = HashMap<Int, List<Pair<String, Int>>>()
     private var tapping = false
+    private var tapStart = 0L
+    private var staleCount = 0
+    private val clockRe = Regex("\\d{1,2}:\\d{2}(:\\d{2})?")
 
     private val idleTicker = object : Runnable {
         override fun run() {
@@ -113,6 +116,7 @@ class AutoAnswerService : AccessibilityService() {
         retries = 0
         cooldownUntil = 0L
         tapping = false
+        staleCount = 0
         status = if (auto) "đang quét" else ""
         refresh()
         handler.removeCallbacks(loop)
@@ -138,6 +142,7 @@ class AutoAnswerService : AccessibilityService() {
     private fun toast(msg: String) = handler.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
 
     private fun tick() {
+        if (tapping && SystemClock.uptimeMillis() - tapStart > 4000) tapping = false  // chuỗi chạm bị kẹt
         if (busy || tapping || SystemClock.uptimeMillis() < cooldownUntil) return
         val key = getSharedPreferences("cfg", MODE_PRIVATE).getString("key", "") ?: ""
         if (key.isBlank()) {
@@ -261,10 +266,10 @@ class AutoAnswerService : AccessibilityService() {
 
     private fun process(items: List<Item>, key: String) {
         if (items.isEmpty()) return
-        val h = items.joinToString("|") { it.text }.hashCode()
+        val h = sig(items)
         if (h != currentHash) { currentHash = h; retries = 0 }
         if (h == lastHash) return
-        val lh = items.joinToString("|") { it.text + it.rect.flattenToString() }.hashCode()
+        val lh = layoutOf(items)
         if (lh != layoutHash) {
             layoutHash = lh
             setStatus("chờ trang ổn định…")
@@ -320,8 +325,20 @@ class AutoAnswerService : AccessibilityService() {
                     toast(err)
                     return@post
                 }
-                val valid = ans.ids.filter { it >= 1 && it <= items.size }.distinct().sorted()
+                // Trong lúc chờ AI, màn hình có thể đã sang câu khác: bỏ kết quả cũ và hỏi lại, tránh chạm nhầm.
+                if (sig(collect()) != h && staleCount < 2) {
+                    staleCount++
+                    lastHash = 0
+                    layoutHash = 0
+                    status = "màn hình đã đổi, hỏi lại…"
+                    refresh()
+                    return@post
+                }
+                staleCount = 0
                 val typed = ans.inputs.filter { (id, v) -> id >= 1 && id <= items.size && items[id - 1].input && v.isNotBlank() }
+                // Câu điền chỗ trống: chỉ gõ chữ, không chạm lại đáp án của câu trắc nghiệm cũ còn hiện trên màn hình.
+                val valid = if (typed.isNotEmpty()) emptyList()
+                            else ans.ids.filter { it >= 1 && it <= items.size }.distinct().sorted()
                 if (valid.isNotEmpty() || typed.isNotEmpty()) {
                     retries = 0
                     val acts = ArrayList<Act>()
@@ -383,8 +400,13 @@ class AutoAnswerService : AccessibilityService() {
         return sb.toString().trimEnd()
     }
 
+    // Bỏ giờ dạng 08:58 khỏi mã băm, nếu không đồng hồ đếm ngược làm màn hình "luôn thay đổi".
+    private fun key(t: String): String = t.replace(clockRe, "#")
+
+    private fun sig(list: List<Item>): Int = list.joinToString("|") { key(it.text) }.hashCode()
+
     private fun layoutOf(list: List<Item>): Int =
-        list.joinToString("|") { it.text + it.rect.flattenToString() }.hashCode()
+        list.joinToString("|") { key(it.text) + it.rect.flattenToString() }.hashCode()
 
     // Lấy lại tọa độ mới nhất của đáp án (trang có thể đã dịch chuyển trong lúc chờ AI).
     private fun resolve(item: Item, occurrence: Int): Item {
@@ -415,7 +437,18 @@ class AutoAnswerService : AccessibilityService() {
 
     // Thực hiện lần lượt các hành động (chạm đáp án / gõ chữ). Bỏ qua ô đã được tích để khỏi bị bỏ tích.
     private fun chooseAll(acts: List<Act>, index: Int) {
+        try {
+            chooseStep(acts, index)
+        } catch (e: Exception) {
+            tapping = false
+            cooldownUntil = SystemClock.uptimeMillis() + 1000
+            toast("Lỗi khi chạm: " + (e.message ?: e.javaClass.simpleName))
+        }
+    }
+
+    private fun chooseStep(acts: List<Act>, index: Int) {
         tapping = true
+        tapStart = SystemClock.uptimeMillis()
         if (index >= acts.size) {
             tapping = false
             cooldownUntil = SystemClock.uptimeMillis() + 500
@@ -450,11 +483,11 @@ class AutoAnswerService : AccessibilityService() {
     private fun afterTap() {
         handler.postDelayed({
             val items2 = collect()
-            val h2 = items2.joinToString("|") { it.text }.hashCode()
+            val h2 = sig(items2)
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
-        }, 400)
+        }, 250)
     }
 
     private fun clickNode(n: AccessibilityNodeInfo?) {
