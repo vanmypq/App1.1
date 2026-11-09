@@ -19,6 +19,9 @@ object ClaudeClient {
 
     @Volatile var lastInfo: String = ""
 
+    // ids: các phần tử cần chạm; inputs: id ô nhập -> chữ cần gõ.
+    data class Answer(val ids: List<Int>, val inputs: Map<Int, String>)
+
     private const val BASE_RULES = "Bạn là giáo viên Toán/Khoa học THCS Việt Nam giải bài trắc nghiệm. Người dùng gửi " +
         "danh sách các phần tử trên màn hình điện thoại, mỗi dòng dạng [số] nội dung, và có thể kèm ẢNH CHỤP " +
         "màn hình. Dùng ảnh để đọc công thức, hình vẽ, bảng biểu mà danh sách chữ thiếu hoặc bị dính chữ " +
@@ -34,6 +37,12 @@ object ClaudeClient {
     private const val FAST_TAIL = "Trả về JSON gồm 2 trường theo thứ tự: \"tinh\" (tính nhẩm/đối chiếu CỰC NGẮN, tối đa 30 từ: " +
         "với bài tính toán phải tính ra kết quả, với bài lý thuyết nêu công thức/định nghĩa đúng rồi so từng phương án) " +
         "và \"ids\". Phải điền \"tinh\" trước rồi mới chọn \"ids\" theo kết quả đó."
+    private const val INPUT_TAIL = "Màn hình có ô nhập chữ (✎). DÙNG Google Search để tìm đáp án chính xác nhất " +
+        "(ưu tiên văn bản pháp luật/nguồn chính thống/sách giáo khoa). Chỉ điền ĐÚNG từ/cụm từ cần điền, ngắn gọn, " +
+        "đúng nguyên văn, KHÔNG giải thích, KHÔNG dấu chấm cuối; bỏ qua '(...)' nằm trong câu lệnh \"điền từ thích hợp\". " +
+        "Nếu một ô có nhiều chỗ trống thì ghi các từ theo thứ tự, cách nhau bằng dấu ';'. Nếu không chắc vẫn đưa đáp án " +
+        "khả dĩ nhất. Dòng cuối cùng là JSON duy nhất: {\"ids\": [số các đáp án trắc nghiệm cần chạm, nếu có], " +
+        "\"nhap\": [{\"id\": số của ô nhập, \"text\": \"chữ cần gõ\"}]}."
     private const val SLOW_TAIL = "Kiểm tra TỪNG phương án (chú ý bẫy hệ số bằng 0, số mũ, mẫu số chứa ẩn), " +
         "chỉ ghi phân tích ngắn gọn tối đa 6 dòng rồi mới in JSON."
 
@@ -71,16 +80,16 @@ object ClaudeClient {
         return result
     }
 
-    private fun buildBody(screenText: String, mode: Int, img: String?, fast: Boolean): JSONObject {
+    private fun buildBody(screenText: String, mode: Int, img: String?, fast: Boolean, search: Boolean): JSONObject {
         val parts = JSONArray()
         if (img != null && mode < 3) {
             parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img)))
         }
         parts.put(JSONObject().put("text", screenText))
-        val gen = JSONObject().put("maxOutputTokens", if (fast) 1024 else 4096)
-        if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (fast) 0 else 1024))
+        val gen = JSONObject().put("maxOutputTokens", if (search || !fast) 4096 else 1024)
+        if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (search) (if (fast) 512 else 1024) else if (fast) 0 else 1024))
         if (mode == 1) gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
-        if (fast && mode < 3) {
+        if (fast && !search && mode < 3) {
             // Ép model chỉ trả {"ids":[...]} (vài token) -> nhanh nhất.
             gen.put("responseMimeType", "application/json")
             gen.put("responseSchema", JSONObject()
@@ -94,11 +103,12 @@ object ClaudeClient {
                 .put("required", JSONArray().put("tinh").put("ids")))
         }
         return JSONObject()
-            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", BASE_RULES + (if (fast) FAST_TAIL else SLOW_TAIL)))))
+            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", BASE_RULES + (if (search) INPUT_TAIL else if (fast) FAST_TAIL else SLOW_TAIL)))))
             .put("contents", JSONArray().put(JSONObject()
                 .put("role", "user")
                 .put("parts", parts)))
             .put("generationConfig", gen)
+            .also { if (search && mode < 3) it.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject()))) }
     }
 
     private fun post(apiKey: String, m: String, body: JSONObject, fast: Boolean): Pair<Int, String> {
@@ -128,6 +138,48 @@ object ClaudeClient {
         return sb.toString()
     }
 
+    private fun extractArray(text: String, from: Int): String? {
+        val start = text.indexOf('[', from)
+        if (start < 0) return null
+        var depth = 0
+        var inStr = false
+        var esc = false
+        for (i in start until text.length) {
+            val ch = text[i]
+            if (inStr) {
+                if (esc) esc = false else if (ch == '\\') esc = true else if (ch == '"') inStr = false
+            } else if (ch == '"') inStr = true
+            else if (ch == '[') depth++
+            else if (ch == ']') {
+                depth--
+                if (depth == 0) return text.substring(start, i + 1)
+            }
+        }
+        return null
+    }
+
+    private fun parseAnswer(text: String): Answer {
+        val ids = parseIds(text)
+        val inputs = LinkedHashMap<Int, String>()
+        try {
+            val pos = text.lastIndexOf("\"nhap\"")
+            if (pos >= 0) {
+                val arr = extractArray(text, pos)
+                if (arr != null) {
+                    val ja = JSONArray(arr)
+                    for (i in 0 until ja.length()) {
+                        val o = ja.optJSONObject(i) ?: continue
+                        val id = o.optInt("id", -1)
+                        val t = o.optString("text", "").trim()
+                        if (id >= 1 && t.isNotEmpty()) inputs[id] = t
+                    }
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return Answer(ids, inputs)
+    }
+
     private fun parseIds(text: String): List<Int> {
         val arr = Regex("\"ids\"\\s*:\\s*\\[([^\\]]*)\\]").findAll(text).lastOrNull()
         if (arr != null) {
@@ -153,7 +205,7 @@ object ClaudeClient {
         }
     }
 
-    fun ask(apiKey: String, screenText: String, fast: Boolean): List<Int> {
+    fun ask(apiKey: String, screenText: String, fast: Boolean, search: Boolean = false): Answer {
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
         val needImg = !fast || screenText.contains("(công thức)")
         val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
@@ -166,17 +218,17 @@ object ClaudeClient {
         while (tries < list.size) {
             val m = list[idx % list.size]
             var mode = modeOf[m] ?: 0
-            var r = post(apiKey, m, buildBody(screenText, mode, img, fast), fast)
+            var r = post(apiKey, m, buildBody(screenText, mode, img, fast, search), if (search) false else fast)
             while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
                 mode++
-                r = post(apiKey, m, buildBody(screenText, mode, img, fast), fast)
+                r = post(apiKey, m, buildBody(screenText, mode, img, fast, search), if (search) false else fast)
             }
             if (r.first in 200..299) {
                 modeOf[m] = mode
                 val text = replyText(r.second)
                 lastInfo = "Model: $m | Nhanh: $fast | Ảnh: " + (if (img != null && mode < 3) "CÓ" else "KHÔNG") +
                     " | Chế độ suy nghĩ: $mode\nAI trả lời:\n$text"
-                return parseIds(text)
+                return parseAnswer(text)
             }
             lastErr = "HTTP ${r.first} ($m): ${r.second.take(120)}"
             if (r.first == 429 || r.first == 404 || r.first == 408 || r.first == 500 || r.first == 503) {
