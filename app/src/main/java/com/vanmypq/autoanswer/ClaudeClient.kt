@@ -43,6 +43,10 @@ object ClaudeClient {
         "Nếu một ô có nhiều chỗ trống thì ghi các từ theo thứ tự, cách nhau bằng dấu ';'. Nếu không chắc vẫn đưa đáp án " +
         "khả dĩ nhất. Dòng cuối cùng là JSON duy nhất: {\"ids\": [số các đáp án trắc nghiệm cần chạm, nếu có], " +
         "\"nhap\": [{\"id\": số của ô nhập, \"text\": \"chữ cần gõ\"}]}."
+    private const val MATH_INPUT_TAIL = " Màn hình có ô nhập đáp số (✎). Hãy TÍNH RA đáp số (ghi phép tính từng bước ngắn gọn " +
+        "trong \"tinh\", tối đa 60 từ), rồi đưa vào \"nhap\": [{\"id\": số của ô nhập, \"text\": \"đáp số\"}]. " +
+        "Chỉ ghi ĐÁP SỐ trong \"text\" (số, hoặc chữ ngắn), KHÔNG kèm đơn vị nếu bên cạnh ô đã có sẵn đơn vị, " +
+        "tuân thủ giới hạn ký tự/định dạng ghi trong đề (dấu thập phân, làm tròn...). Không có đáp án trắc nghiệm thì \"ids\" để rỗng."
     private const val SLOW_TAIL = "Kiểm tra TỪNG phương án (chú ý bẫy hệ số bằng 0, số mũ, mẫu số chứa ẩn), " +
         "chỉ ghi phân tích ngắn gọn tối đa 6 dòng rồi mới in JSON."
 
@@ -80,7 +84,26 @@ object ClaudeClient {
         return result
     }
 
-    private fun buildBody(screenText: String, mode: Int, img: String?, fast: Boolean, search: Boolean): JSONObject {
+    private fun schemaProps(input: Boolean): JSONObject {
+        val props = JSONObject()
+            .put("tinh", JSONObject().put("type", "STRING"))
+            .put("ids", JSONObject()
+                .put("type", "ARRAY")
+                .put("items", JSONObject().put("type", "INTEGER")))
+        if (input) {
+            props.put("nhap", JSONObject()
+                .put("type", "ARRAY")
+                .put("items", JSONObject()
+                    .put("type", "OBJECT")
+                    .put("properties", JSONObject()
+                        .put("id", JSONObject().put("type", "INTEGER"))
+                        .put("text", JSONObject().put("type", "STRING")))
+                    .put("required", JSONArray().put("id").put("text"))))
+        }
+        return props
+    }
+
+    private fun buildBody(screenText: String, mode: Int, img: String?, fast: Boolean, search: Boolean, input: Boolean): JSONObject {
         val parts = JSONArray()
         if (img != null && mode < 3) {
             parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img)))
@@ -94,16 +117,12 @@ object ClaudeClient {
             gen.put("responseMimeType", "application/json")
             gen.put("responseSchema", JSONObject()
                 .put("type", "OBJECT")
-                .put("properties", JSONObject()
-                    .put("tinh", JSONObject().put("type", "STRING"))
-                    .put("ids", JSONObject()
-                        .put("type", "ARRAY")
-                        .put("items", JSONObject().put("type", "INTEGER"))))
-                .put("propertyOrdering", JSONArray().put("tinh").put("ids"))
-                .put("required", JSONArray().put("tinh").put("ids")))
+                .put("properties", schemaProps(input))
+                .put("propertyOrdering", if (input) JSONArray().put("tinh").put("ids").put("nhap") else JSONArray().put("tinh").put("ids"))
+                .put("required", if (input) JSONArray().put("tinh").put("ids").put("nhap") else JSONArray().put("tinh").put("ids")))
         }
         return JSONObject()
-            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", BASE_RULES + (if (search) INPUT_TAIL else if (fast) FAST_TAIL else SLOW_TAIL)))))
+            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", BASE_RULES + (if (search) INPUT_TAIL else (if (fast) FAST_TAIL else SLOW_TAIL) + (if (input) MATH_INPUT_TAIL else ""))))))
             .put("contents", JSONArray().put(JSONObject()
                 .put("role", "user")
                 .put("parts", parts)))
@@ -205,7 +224,11 @@ object ClaudeClient {
         }
     }
 
-    fun ask(apiKey: String, screenText: String, fast: Boolean, search: Boolean = false): Answer {
+    fun ask(apiKey: String, screenText: String, fast: Boolean, hasInput: Boolean = false): Answer {
+        // Có ô nhập: câu tính toán/công thức -> tự tính (nhanh, không cần tra cứu); câu kiến thức/pháp luật -> tra Google Search.
+        val mathy = screenText.contains("(công thức)") ||
+            Regex("(?i)tính|giải|giá trị|rút gọn|phương trình|bằng bao nhiêu|diện tích|chu vi|thể tích").containsMatchIn(screenText)
+        val search = hasInput && !mathy
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
         val needImg = !fast || screenText.contains("(công thức)")
         val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
@@ -218,10 +241,10 @@ object ClaudeClient {
         while (tries < list.size) {
             val m = list[idx % list.size]
             var mode = modeOf[m] ?: 0
-            var r = post(apiKey, m, buildBody(screenText, mode, img, fast, search), if (search) false else fast)
+            var r = post(apiKey, m, buildBody(screenText, mode, img, fast, search, hasInput), if (search) false else fast)
             while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
                 mode++
-                r = post(apiKey, m, buildBody(screenText, mode, img, fast, search), if (search) false else fast)
+                r = post(apiKey, m, buildBody(screenText, mode, img, fast, search, hasInput), if (search) false else fast)
             }
             if (r.first in 200..299) {
                 modeOf[m] = mode
