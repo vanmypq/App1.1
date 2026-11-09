@@ -297,7 +297,7 @@ class AutoAnswerService : AccessibilityService() {
         busy = true
         val fast = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("fast", true)
         val hasInput = items.any { it.input }
-        setStatus(if (hasInput) "AI đang tra cứu…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
+        setStatus(if (hasInput) "AI đang điền…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
         lastSent = text
         exec.execute {
             var got = ClaudeClient.Answer(emptyList(), emptyMap())
