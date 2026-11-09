@@ -9,6 +9,7 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -31,8 +32,12 @@ class AutoAnswerService : AccessibilityService() {
         val rect: Rect,
         val node: AccessibilityNodeInfo?,
         val ctrl: Boolean = false,
-        val checked: Boolean = false
+        val checked: Boolean = false,
+        val input: Boolean = false
     )
+
+    // Một hành động: chạm vào đáp án (text == null) hoặc gõ chữ vào ô nhập (text != null).
+    data class Act(val item: Item, val occ: Int, val text: String? = null)
 
     private val handler = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
@@ -207,8 +212,13 @@ class AutoAnswerService : AccessibilityService() {
                 val r = Rect(); n.getBoundsInScreen(r)
                 val t = (n.text ?: n.contentDescription)?.toString()?.trim()
                 val choice = isChoiceNode(n)
+                val editable = n.isEditable || (n.className?.toString() ?: "").contains("EditText")
                 if (!r.isEmpty) {
-                    if (!t.isNullOrEmpty()) {
+                    if (editable) {
+                        // Chữ gợi ý (placeholder) giữ cố định để mã băm màn hình không đổi khi đã gõ.
+                        val hint = n.hintText?.toString()?.trim() ?: ""
+                        out.add(Item("(ô nhập)" + (if (hint.isNotEmpty()) " " + hint.take(40) else ""), r, n, false, false, true))
+                    } else if (!t.isNullOrEmpty()) {
                         out.add(Item(t.take(400), r, n, choice, choice && n.isChecked))
                     } else if (choice || looksLikeIconButton(n, r)) {
                         out.add(Item("", r, n, true, choice && n.isChecked))
@@ -271,7 +281,7 @@ class AutoAnswerService : AccessibilityService() {
                 lastHash = h
                 status = "nhớ: ${targets.size} đáp án"
                 refresh()
-                chooseAll(targets, 0)
+                chooseAll(targets.map { Act(it.first, it.second) }, 0)
                 return
             }
         }
@@ -286,17 +296,18 @@ class AutoAnswerService : AccessibilityService() {
         lastHash = h
         busy = true
         val fast = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("fast", true)
-        setStatus(if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
+        val hasInput = items.any { it.input }
+        setStatus(if (hasInput) "AI đang tra cứu…" else if (fast) "AI nhanh…" else "AI đang suy nghĩ…")
         lastSent = text
         exec.execute {
-            var got: List<Int> = emptyList()
+            var got = ClaudeClient.Answer(emptyList(), emptyMap())
             var gotErr: String? = null
             try {
-                got = ClaudeClient.ask(key, text, fast)
+                got = ClaudeClient.ask(key, text, fast, hasInput)
             } catch (e: Exception) {
                 gotErr = e.message ?: "lỗi mạng"
             }
-            val ids: List<Int> = got
+            val ans: ClaudeClient.Answer = got
             val err: String? = gotErr
             handler.post {
                 busy = false
@@ -309,19 +320,23 @@ class AutoAnswerService : AccessibilityService() {
                     toast(err)
                     return@post
                 }
-                val valid = ids.filter { it >= 1 && it <= items.size }.distinct().sorted()
-                if (valid.isNotEmpty()) {
+                val valid = ans.ids.filter { it >= 1 && it <= items.size }.distinct().sorted()
+                val typed = ans.inputs.filter { (id, v) -> id >= 1 && id <= items.size && items[id - 1].input && v.isNotBlank() }
+                if (valid.isNotEmpty() || typed.isNotEmpty()) {
                     retries = 0
-                    val targets = valid.map { id ->
+                    val acts = ArrayList<Act>()
+                    for (id in (valid + typed.keys).distinct().sorted()) {
                         val t = items[id - 1].text
-                        Pair(items[id - 1], items.subList(0, id - 1).count { x -> x.text == t })
+                        val occ = items.subList(0, id - 1).count { x -> x.text == t }
+                        acts.add(Act(items[id - 1], occ, typed[id]?.take(100)))
                     }
-                    status = "chọn ${valid.size}: " + items[valid[0] - 1].text.take(25)
+                    status = if (typed.isNotEmpty()) "nhập: " + typed.values.first().take(25)
+                             else "chọn ${valid.size}: " + items[valid[0] - 1].text.take(25)
                     refresh()
-                    if (hasImg || !text.contains("(công thức)")) {
-                        answerCache[h] = targets.map { p -> Pair(p.first.text, p.second) }
+                    if (!hasInput && (hasImg || !text.contains("(công thức)"))) {
+                        answerCache[h] = acts.map { p -> Pair(p.item.text, p.occ) }
                     }
-                    chooseAll(targets, 0)
+                    chooseAll(acts, 0)
                 } else if (retries < 1) {
                     retries++
                     lastHash = 0
@@ -354,12 +369,13 @@ class AutoAnswerService : AccessibilityService() {
         for ((i, item) in items.withIndex()) {
             val t = item.text
             val isChoiceLetter = t.length == 1 && t[0] in 'A'..'D'
-            val short = !item.ctrl && t.length <= 2 && !isChoiceLetter && !t.startsWith("(")
+            val short = !item.ctrl && !item.input && t.length <= 2 && !isChoiceLetter && !t.startsWith("(")
             if (short) {
                 run.add(i)
             } else {
                 flush()
                 if (item.ctrl) sb.append("[${i + 1}] ").append(if (item.checked) "☑ " else "☐ ").append(t).append('\n')
+                else if (item.input) sb.append("[${i + 1}] ✎ ").append(t).append('\n')
                 else sb.append("[${i + 1}] ").append(t).append('\n')
             }
         }
@@ -383,23 +399,43 @@ class AutoAnswerService : AccessibilityService() {
         return item
     }
 
-    // Chạm lần lượt tất cả đáp án (nhiều câu / nhiều đáp án đúng / Đúng-Sai). Bỏ qua ô đã được tích để khỏi bị bỏ tích.
-    private fun chooseAll(targets: List<Pair<Item, Int>>, index: Int) {
+    // Gõ chữ vào ô nhập: SET_TEXT trước, nếu app/web không nhận thì dán qua clipboard.
+    private fun typeInto(n: AccessibilityNodeInfo?, text: String): Boolean {
+        if (n == null) return false
+        n.refresh()
+        n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle()
+        args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+        val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("ans", text))
+        n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        return n.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+    }
+
+    // Thực hiện lần lượt các hành động (chạm đáp án / gõ chữ). Bỏ qua ô đã được tích để khỏi bị bỏ tích.
+    private fun chooseAll(acts: List<Act>, index: Int) {
         tapping = true
-        if (index >= targets.size) {
+        if (index >= acts.size) {
             tapping = false
-            cooldownUntil = SystemClock.uptimeMillis() + 300
+            cooldownUntil = SystemClock.uptimeMillis() + 500
             afterTap()
             return
         }
-        val cur = resolve(targets[index].first, targets[index].second)
+        val act = acts[index]
+        val cur = resolve(act.item, act.occ)
+        val next = { handler.postDelayed({ chooseAll(acts, index + 1) }, 30) }
+        if (act.text != null) {
+            if (!typeInto(cur.node, act.text)) toast("Không gõ được vào ô nhập (ứng dụng chặn)")
+            next()
+            return
+        }
         val n = cur.node
         var already = false
         if (cur.ctrl && n != null) {
             n.refresh()
             already = n.isCheckable && n.isChecked
         }
-        val next = { handler.postDelayed({ chooseAll(targets, index + 1) }, 30) }
         if (already) {
             next()
             return
@@ -418,7 +454,7 @@ class AutoAnswerService : AccessibilityService() {
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
-        }, 300)
+        }, 400)
     }
 
     private fun clickNode(n: AccessibilityNodeInfo?) {
