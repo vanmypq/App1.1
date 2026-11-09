@@ -31,7 +31,9 @@ object ClaudeClient {
         "lại ô đã ☑ trừ khi sai. Dòng cuối cùng phải là JSON duy nhất: {\"ids\": [N, N, ...]} gồm số [id] của MỌI " +
         "phần tử cần bấm, theo thứ tự từ trên xuống. Nếu màn hình không có câu trắc nghiệm hoặc không chắc chắn, " +
         "trả {\"ids\": []}. "
-    private const val FAST_TAIL = "TRẢ LỜI NGAY, KHÔNG giải thích, chỉ in đúng một dòng JSON."
+    private const val FAST_TAIL = "Trả về JSON gồm 2 trường theo thứ tự: \"tinh\" (tính nhẩm/đối chiếu CỰC NGẮN, tối đa 30 từ: " +
+        "với bài tính toán phải tính ra kết quả, với bài lý thuyết nêu công thức/định nghĩa đúng rồi so từng phương án) " +
+        "và \"ids\". Phải điền \"tinh\" trước rồi mới chọn \"ids\" theo kết quả đó."
     private const val SLOW_TAIL = "Kiểm tra TỪNG phương án (chú ý bẫy hệ số bằng 0, số mũ, mẫu số chứa ẩn), " +
         "chỉ ghi phân tích ngắn gọn tối đa 6 dòng rồi mới in JSON."
 
@@ -83,10 +85,13 @@ object ClaudeClient {
             gen.put("responseMimeType", "application/json")
             gen.put("responseSchema", JSONObject()
                 .put("type", "OBJECT")
-                .put("properties", JSONObject().put("ids", JSONObject()
-                    .put("type", "ARRAY")
-                    .put("items", JSONObject().put("type", "INTEGER"))))
-                .put("required", JSONArray().put("ids")))
+                .put("properties", JSONObject()
+                    .put("tinh", JSONObject().put("type", "STRING"))
+                    .put("ids", JSONObject()
+                        .put("type", "ARRAY")
+                        .put("items", JSONObject().put("type", "INTEGER"))))
+                .put("propertyOrdering", JSONArray().put("tinh").put("ids"))
+                .put("required", JSONArray().put("tinh").put("ids")))
         }
         return JSONObject()
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", BASE_RULES + (if (fast) FAST_TAIL else SLOW_TAIL)))))
@@ -153,8 +158,8 @@ object ClaudeClient {
         val needImg = !fast || screenText.contains("(công thức)")
         val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
         val base = models ?: DEFAULT_MODELS
-        // Nhanh: ưu tiên bản Lite (nhanh gấp ~2 lần); Chính xác: ưu tiên bản Flash đầy đủ.
-        val list = if (fast) base.sortedBy { if (it.contains("lite")) 0 else 1 } else base
+        // Cả hai chế độ đều ưu tiên Flash đầy đủ (Lite hay đoán sai bài toán); Lite chỉ là dự phòng khi lỗi/hết hạn mức.
+        val list = base
         if (idx != 0 && System.currentTimeMillis() - switchedAt > 300000L) idx = 0
         var lastErr = "không có model"
         var tries = 0
