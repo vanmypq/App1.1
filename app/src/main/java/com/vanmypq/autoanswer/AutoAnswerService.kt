@@ -62,8 +62,13 @@ class AutoAnswerService : AccessibilityService() {
         override fun run() {
             if (!auto) return
             tick()
-            handler.postDelayed(this, 250)
+            handler.postDelayed(this, 200)
         }
+    }
+
+    private val eventTick = Runnable {
+        tick()
+        handler.postDelayed({ tick() }, 90)
     }
 
     override fun onServiceConnected() {
@@ -106,7 +111,11 @@ class AutoAnswerService : AccessibilityService() {
         status = if (auto) "đang quét" else ""
         refresh()
         handler.removeCallbacks(loop)
-        if (auto) handler.post(loop)
+        if (auto) {
+            handler.post(loop)
+            val k = getSharedPreferences("cfg", MODE_PRIVATE).getString("key", "") ?: ""
+            if (k.isNotBlank()) exec.execute { ClaudeClient.warmUp(k) }
+        }
     }
 
     private fun refresh() {
@@ -363,15 +372,14 @@ class AutoAnswerService : AccessibilityService() {
 
     // Lấy lại tọa độ mới nhất của đáp án (trang có thể đã dịch chuyển trong lúc chờ AI).
     private fun resolve(item: Item, occurrence: Int): Item {
-        val fresh = collect().filter { it.text == item.text }
-        if (fresh.size > occurrence) return fresh[occurrence]
         val n = item.node
-        if (n != null) {
-            n.refresh()
+        if (n != null && n.refresh()) {
             val r = Rect()
             n.getBoundsInScreen(r)
-            if (!r.isEmpty) return item.copy(rect = r)
+            if (!r.isEmpty && n.isVisibleToUser) return item.copy(rect = r)
         }
+        val fresh = collect().filter { it.text == item.text }
+        if (fresh.size > occurrence) return fresh[occurrence]
         return item
     }
 
@@ -380,7 +388,7 @@ class AutoAnswerService : AccessibilityService() {
         tapping = true
         if (index >= targets.size) {
             tapping = false
-            cooldownUntil = SystemClock.uptimeMillis() + 700
+            cooldownUntil = SystemClock.uptimeMillis() + 300
             afterTap()
             return
         }
@@ -391,7 +399,7 @@ class AutoAnswerService : AccessibilityService() {
             n.refresh()
             already = n.isCheckable && n.isChecked
         }
-        val next = { handler.postDelayed({ chooseAll(targets, index + 1) }, 60) }
+        val next = { handler.postDelayed({ chooseAll(targets, index + 1) }, 30) }
         if (already) {
             next()
             return
@@ -410,7 +418,7 @@ class AutoAnswerService : AccessibilityService() {
             lastHash = h2
             currentHash = h2
             layoutHash = layoutOf(items2)
-        }, 500)
+        }, 300)
     }
 
     private fun clickNode(n: AccessibilityNodeInfo?) {
@@ -436,7 +444,7 @@ class AutoAnswerService : AccessibilityService() {
         val y = r.exactCenterY().coerceIn(2f, dm.heightPixels - 2f)
         val p = Path().apply { moveTo(x, y) }
         val g = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(p, 0, 40)).build()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 30)).build()
         val ok = dispatchGesture(g, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) { onDone(true) }
             override fun onCancelled(gestureDescription: GestureDescription?) { onDone(false) }
@@ -444,7 +452,12 @@ class AutoAnswerService : AccessibilityService() {
         if (!ok) onDone(false)
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!auto || event == null) return
+        if (event.packageName?.toString() == packageName) return
+        handler.removeCallbacks(eventTick)
+        handler.postDelayed(eventTick, 60)
+    }
     override fun onInterrupt() {}
     override fun onDestroy() {
         handler.removeCallbacks(loop)
