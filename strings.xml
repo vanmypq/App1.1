@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Auto Trắc Nghiệm</string>
+    <string name="service_desc">Đọc nội dung màn hình, nhờ AI chọn đáp án và tự bấm.</string>
+</resources>
