@@ -78,6 +78,16 @@ object ClaudeClient {
         val gen = JSONObject().put("maxOutputTokens", if (fast) 1024 else 4096)
         if (mode == 0) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", if (fast) 0 else 1024))
         if (mode == 1) gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
+        if (fast && mode < 3) {
+            // Ép model chỉ trả {"ids":[...]} (vài token) -> nhanh nhất.
+            gen.put("responseMimeType", "application/json")
+            gen.put("responseSchema", JSONObject()
+                .put("type", "OBJECT")
+                .put("properties", JSONObject().put("ids", JSONObject()
+                    .put("type", "ARRAY")
+                    .put("items", JSONObject().put("type", "INTEGER"))))
+                .put("required", JSONArray().put("ids")))
+        }
         return JSONObject()
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", BASE_RULES + (if (fast) FAST_TAIL else SLOW_TAIL)))))
             .put("contents", JSONArray().put(JSONObject()
@@ -86,12 +96,12 @@ object ClaudeClient {
             .put("generationConfig", gen)
     }
 
-    private fun post(apiKey: String, m: String, body: JSONObject): Pair<Int, String> {
+    private fun post(apiKey: String, m: String, body: JSONObject, fast: Boolean): Pair<Int, String> {
         try {
             val c = URL("$BASE/models/$m:generateContent").openConnection() as HttpURLConnection
             c.requestMethod = "POST"
-            c.connectTimeout = 8000
-            c.readTimeout = 45000
+            c.connectTimeout = 5000
+            c.readTimeout = if (fast) 10000 else 30000
             c.doOutput = true
             c.setRequestProperty("Content-Type", "application/json")
             c.setRequestProperty("x-goog-api-key", apiKey)
@@ -125,22 +135,36 @@ object ClaudeClient {
     // Không gọi danh sách model trước (bớt 1 vòng mạng); chỉ dò model khi mọi model mặc định đều lỗi.
     private val DEFAULT_MODELS = listOf("gemini-flash-latest", "gemini-flash-lite-latest")
 
+    // Mở sẵn kết nối HTTPS khi bật nút AI để câu đầu tiên không mất thời gian bắt tay TLS.
+    fun warmUp(apiKey: String) {
+        try {
+            val c = URL("$BASE/models/gemini-flash-lite-latest").openConnection() as HttpURLConnection
+            c.connectTimeout = 5000
+            c.readTimeout = 5000
+            c.setRequestProperty("x-goog-api-key", apiKey)
+            c.responseCode
+            (try { c.inputStream } catch (e: Exception) { c.errorStream })?.use { it.readBytes() }
+        } catch (e: Exception) {
+        }
+    }
+
     fun ask(apiKey: String, screenText: String, fast: Boolean): List<Int> {
         // Chế độ nhanh chỉ gửi ảnh khi có công thức; chế độ chính xác luôn gửi ảnh.
         val needImg = !fast || screenText.contains("(công thức)")
-        val img: String? = if (needImg) (try { CaptureService.grab() } catch (e: Exception) { null }) else null
-        val list = models ?: DEFAULT_MODELS
+        val img: String? = if (needImg) (try { CaptureService.grab(if (fast) 1000 else 0) } catch (e: Exception) { null }) else null
+        val base = models ?: DEFAULT_MODELS
+        // Nhanh: ưu tiên bản Lite (nhanh gấp ~2 lần); Chính xác: ưu tiên bản Flash đầy đủ.
+        val list = if (fast) base.sortedBy { if (it.contains("lite")) 0 else 1 } else base
         if (idx != 0 && System.currentTimeMillis() - switchedAt > 300000L) idx = 0
         var lastErr = "không có model"
         var tries = 0
         while (tries < list.size) {
             val m = list[idx % list.size]
             var mode = modeOf[m] ?: 0
-            var r = post(apiKey, m, buildBody(screenText, mode, img, fast))
+            var r = post(apiKey, m, buildBody(screenText, mode, img, fast), fast)
             while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
                 mode++
-                if (mode == 3 && img == null) break
-                r = post(apiKey, m, buildBody(screenText, mode, img, fast))
+                r = post(apiKey, m, buildBody(screenText, mode, img, fast), fast)
             }
             if (r.first in 200..299) {
                 modeOf[m] = mode
