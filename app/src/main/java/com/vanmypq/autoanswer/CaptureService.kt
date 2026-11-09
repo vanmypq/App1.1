@@ -34,7 +34,7 @@ class CaptureService : Service() {
 
         // Trả về ảnh màn hình hiện tại dạng JPEG base64, hoặc null nếu chưa cấp quyền.
         @Synchronized
-        fun grab(): String? {
+        fun grab(maxSide: Int = 0): String? {
             val r = reader ?: return null
             var image: android.media.Image? = null
             try {
@@ -51,7 +51,12 @@ class CaptureService : Service() {
                     bmp.copyPixelsFromBuffer(plane.buffer)
                     val cropped = Bitmap.createBitmap(bmp, 0, 0, w, h)
                     val bos = ByteArrayOutputStream()
-                    cropped.compress(Bitmap.CompressFormat.JPEG, 65, bos)
+                    var out = cropped
+                    if (maxSide > 0 && maxOf(w, h) > maxSide) {
+                        val sc = maxSide.toFloat() / maxOf(w, h)
+                        out = Bitmap.createScaledBitmap(cropped, (w * sc).toInt(), (h * sc).toInt(), true)
+                    }
+                    out.compress(Bitmap.CompressFormat.JPEG, if (maxSide > 0) 55 else 65, bos)
                     cached = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
                 } catch (e: Exception) {
                 } finally {
