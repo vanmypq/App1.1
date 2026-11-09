@@ -33,7 +33,9 @@ object ClaudeClient {
         "phương án KHÔNG thỏa điều kiện. Ưu tiên bấm ô tích chọn (☐) hoặc chữ cái A/B/C/D của đáp án; không chọn " +
         "lại ô đã ☑ trừ khi sai. Dòng cuối cùng phải là JSON duy nhất: {\"ids\": [N, N, ...]} gồm số [id] của MỌI " +
         "phần tử cần bấm, theo thứ tự từ trên xuống. Nếu màn hình không có câu trắc nghiệm hoặc không chắc chắn, " +
-        "trả {\"ids\": []}. "
+        "trả {\"ids\": []}. CHỈ trả lời câu CHƯA được làm: bỏ qua câu đã hiện kết quả (có dòng như 'Chưa đúng', " +
+        "'Chính xác', 'Đáp án đúng là', ô đã tô màu đúng/sai) và các nút điều hướng số câu; câu cần làm thường nằm " +
+        "gần ô nhập hoặc ở cuối màn hình. "
     private const val FAST_TAIL = "Trả về JSON gồm 2 trường theo thứ tự: \"tinh\" (tính nhẩm/đối chiếu CỰC NGẮN, tối đa 30 từ: " +
         "với bài tính toán phải tính ra kết quả, với bài lý thuyết nêu công thức/định nghĩa đúng rồi so từng phương án) " +
         "và \"ids\". Phải điền \"tinh\" trước rồi mới chọn \"ids\" theo kết quả đó."
@@ -70,6 +72,7 @@ object ClaudeClient {
             if (!methods.contains("generateContent") || !n.startsWith("gemini-") ||
                 !n.contains("flash") || skip.any { n.contains(it) }
             ) continue
+            if (n.contains("preview") || n.contains("omni")) continue
             if (n.contains("lite")) lite.add(n) else flash.add(n)
         }
         val list = ArrayList<String>()
@@ -240,14 +243,15 @@ object ClaudeClient {
         var tries = 0
         while (tries < list.size) {
             val m = list[idx % list.size]
-            var mode = modeOf[m] ?: 0
+            val mk = "$m|$search|$hasInput|$fast"
+            var mode = modeOf[mk] ?: 0
             var r = post(apiKey, m, buildBody(screenText, mode, img, fast, search, hasInput), if (search) false else fast)
             while (r.first == 400 && mode < 3 && !r.second.contains("API key", ignoreCase = true)) {
                 mode++
                 r = post(apiKey, m, buildBody(screenText, mode, img, fast, search, hasInput), if (search) false else fast)
             }
             if (r.first in 200..299) {
-                modeOf[m] = mode
+                if (mode < 3) modeOf[mk] = mode
                 val text = replyText(r.second)
                 lastInfo = "Model: $m | Nhanh: $fast | Ảnh: " + (if (img != null && mode < 3) "CÓ" else "KHÔNG") +
                     " | Chế độ suy nghĩ: $mode\nAI trả lời:\n$text"
